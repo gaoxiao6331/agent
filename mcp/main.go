@@ -3,59 +3,115 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
+	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
 func main() {
+
+	basePath := normalizePath(getEnv("MCP_BASE_PATH", "/mcp"))
+	port := getEnv("MCP_PORT", "8080")
+
 	s := server.NewMCPServer("Go MCP Demo Server", "1.0.0")
 
-	greetTool := mcp.NewTool("greet",
-		mcp.WithDescription("对指定的人进行友好地问候"),
-		mcp.WithString("name", mcp.Required(), mcp.Description("要问候的人的名字")),
+	// ========== tools ==========
+	s.AddTool(
+		mcp.NewTool("greet",
+			mcp.WithDescription("问候"),
+			mcp.WithString("name", mcp.Required()),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			name := req.Params.Arguments.(map[string]any)["name"].(string)
+			return mcp.NewToolResultText("你好，" + name), nil
+		},
 	)
 
-	s.AddTool(greetTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args, ok := req.Params.Arguments.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("无效的参数")
-		}
-		name, ok := args["name"].(string)
-		if !ok {
-			return nil, fmt.Errorf("参数 name 必须是字符串类型")
-		}
-		greeting := fmt.Sprintf("你好，%s！欢迎使用由 Golang 实现的 Model Context Protocol (MCP) 服务！", name)
-		return mcp.NewToolResultText(greeting), nil
-	})
-
-	addTool := mcp.NewTool("add",
-		mcp.WithDescription("计算两个数字的和"),
-		mcp.WithNumber("a", mcp.Required(), mcp.Description("第一个加数")),
-		mcp.WithNumber("b", mcp.Required(), mcp.Description("第二个加数")),
+	s.AddTool(
+		mcp.NewTool("add",
+			mcp.WithDescription("加法"),
+			mcp.WithNumber("a", mcp.Required()),
+			mcp.WithNumber("b", mcp.Required()),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			args := req.Params.Arguments.(map[string]any)
+			a := args["a"].(float64)
+			b := args["b"].(float64)
+			return mcp.NewToolResultText(fmt.Sprintf("%v", a+b)), nil
+		},
 	)
 
-	s.AddTool(addTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args, ok := req.Params.Arguments.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("无效的参数")
-		}
-		a, okA := args["a"].(float64)
-		b, okB := args["b"].(float64)
-		if !okA || !okB {
-			return nil, fmt.Errorf("参数 a 和 b 必须是数字类型")
-		}
-		result := a + b
-		return mcp.NewToolResultText(fmt.Sprintf("计算结果: %f + %f = %f", a, b, result)), nil
+	streamSrv := server.NewStreamableHTTPServer(s)
+
+	mux := http.NewServeMux()
+
+	// ✅ 关键修复：同时兼容 /mcp 和 /mcp/
+	mux.Handle(basePath, mcpHandler(streamSrv))
+	mux.Handle(basePath+"/", mcpHandler(streamSrv))
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
 	})
 
-	port := ":8080"
-	fmt.Fprintf(os.Stderr, "正在启动 Go MCP 服务端，监听端口 %s\n", port)
+	fmt.Println("🚀 MCP running")
+	fmt.Println("   port:", port)
+	fmt.Println("   basePath:", basePath)
 
-	sse := server.NewSSEServer(s)
-	if err := sse.Start(port); err != nil {
-		fmt.Fprintf(os.Stderr, "服务运行出错: %v\n", err)
-		os.Exit(1)
+	log.Fatal(http.ListenAndServe(":"+port, mux))
+}
+
+// =========================
+// MCP handler middleware
+// =========================
+func mcpHandler(streamSrv *server.StreamableHTTPServer) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		start := time.Now()
+
+		defer func() {
+			if err := recover(); err != nil {
+				fmt.Println("❌ panic:", err)
+			}
+		}()
+
+		fmt.Println("━━━━━━━━━━━━━━━━━━━━")
+		fmt.Println("➡️", r.Method, r.URL.Path)
+
+		// ⚠️ 只建议 debug 时打开
+		body, _ := io.ReadAll(r.Body)
+		if len(body) > 0 {
+			fmt.Println("📦 body:", string(body))
+		}
+
+		// restore body（避免 MCP 读不到）
+		r.Body = io.NopCloser(strings.NewReader(string(body)))
+
+		streamSrv.ServeHTTP(w, r)
+
+		fmt.Println("⬅️ done cost:", time.Since(start))
+	})
+}
+
+// =========================
+// utils
+// =========================
+func getEnv(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
 	}
+	return def
+}
+
+// 保证 MCP path 不带尾斜杠
+func normalizePath(p string) string {
+	if p == "" {
+		return "/mcp"
+	}
+	return "/" + strings.Trim(p, "/")
 }
